@@ -1,0 +1,19 @@
+[Unit]
+Description=Self-hosted post scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scheduler
+Group=scheduler
+WorkingDirectory=/opt/post-scheduler
+ExecStart=/usr/bin/node /opt/post-scheduler/dist/index.js
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
