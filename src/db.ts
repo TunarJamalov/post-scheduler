@@ -36,6 +36,23 @@ export interface Post {
   createdAt: number;
   updatedAt: number;
 }
+export interface MediaItem {
+  id: string;
+  postId: string | null;
+  /** Thread part the image belongs to (0-based). */
+  segment: number;
+  position: number;
+  filename: string;
+  mime: string;
+  size: number;
+  alt: string;
+  createdAt: number;
+}
+export interface MediaAttachment {
+  id: string;
+  segment: number;
+  alt: string;
+}
 export interface PostEvent {
   id: number;
   postId: string;
@@ -45,6 +62,10 @@ export interface PostEvent {
 }
 
 export const SEGMENT_LIMITS: Record<Provider, number> = { mastodon: 500, bluesky: 300 };
+/** Maximum image size per provider in bytes. */
+export const MEDIA_LIMITS: Record<Provider, number> = { mastodon: 16 * 1024 * 1024, bluesky: 1_000_000 };
+export const MAX_IMAGES_PER_PART = 4;
+export const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
 
 export function openDatabase(filename: string): Database.Database {
   const dir = path.dirname(filename);
@@ -84,7 +105,20 @@ export function openDatabase(filename: string): Database.Database {
       event TEXT NOT NULL,
       detail TEXT
     );
+    CREATE TABLE IF NOT EXISTS media (
+      id TEXT PRIMARY KEY,
+      post_id TEXT REFERENCES posts(id) ON DELETE CASCADE,
+      segment INTEGER NOT NULL DEFAULT 0,
+      position INTEGER NOT NULL DEFAULT 0,
+      filename TEXT NOT NULL,
+      mime TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      alt TEXT NOT NULL DEFAULT '',
+      data BLOB NOT NULL,
+      created_at INTEGER NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS posts_due ON posts(status, scheduled_at);
+    CREATE INDEX IF NOT EXISTS media_post ON media(post_id, segment, position);
     CREATE INDEX IF NOT EXISTS post_events_post ON post_events(post_id, at);
   `);
   return db;
@@ -149,20 +183,26 @@ export function listPosts(db: Database.Database, status?: PostStatus): Post[] {
     .all(...(status ? [status] : []))
     .map(toPost);
 }
+export interface PostInput {
+  accountId: string;
+  segments: string[];
+  scheduledAt: number | null;
+  status?: 'draft' | 'scheduled';
+  media?: MediaAttachment[];
+}
+
 export function getPost(db: Database.Database, id: string): Post | undefined {
   const row = db.prepare(`SELECT ${postColumns} WHERE id=?`).get(id);
   return row ? toPost(row) : undefined;
 }
-export function createPost(
-  db: Database.Database,
-  input: { accountId: string; segments: string[]; scheduledAt: number | null; status?: 'draft' | 'scheduled' }
-): Post {
+export function createPost(db: Database.Database, input: PostInput): Post {
   const id = randomUUID();
   const now = Date.now();
   const status = input.status ?? (input.scheduledAt ? 'scheduled' : 'draft');
   db.prepare(
     'INSERT INTO posts (id,account_id,segments_json,status,scheduled_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?)'
   ).run(id, input.accountId, JSON.stringify(input.segments), status, input.scheduledAt, now, now);
+  attachMedia(db, id, input.media ?? []);
   addEvent(
     db,
     id,
@@ -171,11 +211,7 @@ export function createPost(
   );
   return getPost(db, id)!;
 }
-export function updatePost(
-  db: Database.Database,
-  id: string,
-  input: { accountId: string; segments: string[]; scheduledAt: number | null; status?: 'draft' | 'scheduled' }
-): Post {
+export function updatePost(db: Database.Database, id: string, input: PostInput): Post {
   const current = getPost(db, id);
   if (!current) throw new Error('Post not found');
   if (current.status === 'published' || current.status === 'publishing')
@@ -184,6 +220,7 @@ export function updatePost(
   db.prepare(
     'UPDATE posts SET account_id=?,segments_json=?,status=?,scheduled_at=?,error=NULL,attempts=0,updated_at=? WHERE id=?'
   ).run(input.accountId, JSON.stringify(input.segments), status, input.scheduledAt, Date.now(), id);
+  attachMedia(db, id, input.media ?? []);
   addEvent(
     db,
     id,
@@ -192,6 +229,57 @@ export function updatePost(
   );
   return getPost(db, id)!;
 }
+/* ---------- Media ---------- */
+const mediaColumns =
+  'id,post_id as postId,segment,position,filename,mime,size,alt,created_at as createdAt FROM media';
+
+export function storeMedia(
+  db: Database.Database,
+  input: { filename: string; mime: string; data: Buffer; alt?: string }
+): MediaItem {
+  const id = randomUUID();
+  db.prepare(
+    'INSERT INTO media (id,post_id,segment,position,filename,mime,size,alt,data,created_at) VALUES (?,NULL,0,0,?,?,?,?,?,?)'
+  ).run(id, input.filename, input.mime, input.data.length, input.alt ?? '', input.data, Date.now());
+  return getMedia(db, id)!;
+}
+export function getMedia(db: Database.Database, id: string): MediaItem | undefined {
+  return db.prepare(`SELECT ${mediaColumns} WHERE id=?`).get(id) as MediaItem | undefined;
+}
+export function mediaData(db: Database.Database, id: string): { mime: string; data: Buffer } | undefined {
+  return db.prepare('SELECT mime,data FROM media WHERE id=?').get(id) as
+    { mime: string; data: Buffer } | undefined;
+}
+export function postMedia(db: Database.Database, postId: string): MediaItem[] {
+  return db
+    .prepare(`SELECT ${mediaColumns} WHERE post_id=? ORDER BY segment,position`)
+    .all(postId) as MediaItem[];
+}
+/** Links uploaded media to a post in the given order; media no longer listed is detached from the post. */
+export function attachMedia(db: Database.Database, postId: string, attachments: MediaAttachment[]) {
+  db.transaction(() => {
+    db.prepare('UPDATE media SET post_id=NULL WHERE post_id=?').run(postId);
+    const counters = new Map<number, number>();
+    const link = db.prepare(
+      'UPDATE media SET post_id=?,segment=?,position=?,alt=? WHERE id=? AND (post_id IS NULL OR post_id=?)'
+    );
+    for (const a of attachments) {
+      const position = counters.get(a.segment) ?? 0;
+      counters.set(a.segment, position + 1);
+      if (!link.run(postId, a.segment, position, a.alt, a.id, postId).changes)
+        throw new Error(`Unknown media ${a.id}`);
+    }
+  })();
+}
+export function removeMedia(db: Database.Database, id: string) {
+  return db.prepare('DELETE FROM media WHERE id=? AND post_id IS NULL').run(id).changes > 0;
+}
+/** Deletes uploads that were never attached to a post. */
+export function cleanupMedia(db: Database.Database, olderThanMs = 24 * 60 * 60 * 1000, now = Date.now()) {
+  return db.prepare('DELETE FROM media WHERE post_id IS NULL AND created_at < ?').run(now - olderThanMs)
+    .changes;
+}
+
 export function setPostStatus(db: Database.Database, id: string, status: PostStatus, detail?: string) {
   db.prepare('UPDATE posts SET status=?,updated_at=? WHERE id=?').run(status, Date.now(), id);
   addEvent(db, id, status, detail ?? null);

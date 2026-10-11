@@ -6,6 +6,8 @@ import {
   getAccountSecrets,
   markFailed,
   markPublished,
+  mediaData,
+  postMedia,
   type Post,
   type Provider,
 } from './db.js';
@@ -51,8 +53,12 @@ export async function publishPost(
   const client = options.clients?.[account.provider] ?? clientFor(account.provider);
   let previous: PublishedItem | undefined;
   let first: PublishedItem | undefined;
-  for (const segment of post.segments) {
-    previous = await client.publish(account, secrets, segment, previous);
+  const media = postMedia(db, post.id);
+  for (const [index, segment] of post.segments.entries()) {
+    const uploads = media
+      .filter((m) => m.segment === index)
+      .map((m) => ({ ...mediaData(db, m.id)!, alt: m.alt, filename: m.filename }));
+    previous = await client.publish(account, secrets, segment, previous, uploads);
     first ??= previous;
   }
   return first!;

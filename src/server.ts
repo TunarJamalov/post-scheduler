@@ -17,8 +17,17 @@ import {
   verifyTotp,
 } from './auth.js';
 import {
+  IMAGE_TYPES,
+  MAX_IMAGES_PER_PART,
+  MEDIA_LIMITS,
+  cleanupMedia,
   createPost,
   getAccount,
+  getMedia,
+  mediaData,
+  postMedia,
+  removeMedia,
+  storeMedia,
   getAccountSecrets,
   getPost,
   listAccounts,
@@ -91,12 +100,24 @@ function parsePost(db: Database.Database, body: any) {
   if (scheduledAt !== null && !Number.isFinite(scheduledAt))
     throw new Error('scheduledAt must be a timestamp in milliseconds');
   const status = body.status === 'draft' ? 'draft' : scheduledAt ? 'scheduled' : 'draft';
-  return {
-    accountId,
-    segments,
-    scheduledAt: status === 'draft' ? scheduledAt : scheduledAt,
-    status: status as 'draft' | 'scheduled',
-  };
+  const media = Array.isArray(body.media) ? body.media : [];
+  const perSegment = new Map<number, number>();
+  const attachments = media.map((m: any) => {
+    const item = typeof m?.id === 'string' ? getMedia(db, m.id) : undefined;
+    if (!item) throw new Error('An attached image no longer exists; upload it again');
+    const segment = Number(m.segment ?? 0);
+    if (!Number.isInteger(segment) || segment < 0 || segment >= segments.length)
+      throw new Error('An image is attached to a thread part that does not exist');
+    if (item.size > MEDIA_LIMITS[account.provider])
+      throw new Error(
+        `${item.filename} is ${(item.size / 1024).toFixed(0)} KB; ${account.provider} allows ${(MEDIA_LIMITS[account.provider] / 1024).toFixed(0)} KB per image`
+      );
+    perSegment.set(segment, (perSegment.get(segment) ?? 0) + 1);
+    if (perSegment.get(segment)! > MAX_IMAGES_PER_PART)
+      throw new Error(`At most ${MAX_IMAGES_PER_PART} images per part`);
+    return { id: item.id, segment, alt: typeof m.alt === 'string' ? m.alt.trim().slice(0, 1500) : '' };
+  });
+  return { accountId, segments, scheduledAt, status: status as 'draft' | 'scheduled', media: attachments };
 }
 
 export function createServer(db: Database.Database, options: ServerOptions = {}) {
@@ -113,6 +134,7 @@ export function createServer(db: Database.Database, options: ServerOptions = {})
   app.disable('x-powered-by');
   app.set('trust proxy', process.env.TRUST_PROXY ?? 'loopback');
   app.use(express.json({ limit: '200kb' }));
+  app.use('/api/admin/media', express.raw({ type: IMAGE_TYPES, limit: '16mb' }));
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
@@ -276,7 +298,30 @@ export function createServer(db: Database.Database, options: ServerOptions = {})
   });
 
   const withEvents = (post: ReturnType<typeof getPost>) =>
-    post ? { ...post, events: postEvents(db, post.id) } : undefined;
+    post ? { ...post, events: postEvents(db, post.id), media: postMedia(db, post.id) } : undefined;
+
+  /* Images are uploaded as raw bodies: POST /api/admin/media?filename=a.png with an image/* content type. */
+  app.post('/api/admin/media', (q, r) => {
+    const mime = (q.headers['content-type'] ?? '').split(';')[0].trim();
+    if (!IMAGE_TYPES.includes(mime))
+      return r.status(415).send(`Unsupported image type; use ${IMAGE_TYPES.join(', ')}`);
+    if (!Buffer.isBuffer(q.body) || !q.body.length) return r.status(400).send('Image body is empty');
+    const filename =
+      String(q.query.filename ?? 'image')
+        .replace(/[^\w.-]/g, '_')
+        .slice(0, 120) || 'image';
+    cleanupMedia(db);
+    r.status(201).json(storeMedia(db, { filename, mime, data: q.body, alt: String(q.query.alt ?? '') }));
+  });
+  app.get('/api/admin/media/:id', (q, r) => {
+    const item = mediaData(db, q.params.id);
+    if (!item) return r.sendStatus(404);
+    r.setHeader('Cache-Control', 'private, max-age=3600');
+    r.type(item.mime).send(item.data);
+  });
+  app.delete('/api/admin/media/:id', (q, r) =>
+    removeMedia(db, q.params.id) ? r.sendStatus(204) : r.sendStatus(404)
+  );
   app.get('/api/admin/posts', (q, r) => {
     const status = typeof q.query.status === 'string' ? (q.query.status as any) : undefined;
     r.json(listPosts(db, status).map((p) => withEvents(p)));

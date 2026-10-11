@@ -12,6 +12,7 @@ A small, self-hosted alternative to hosted post schedulers such as Typefully. Wr
 - Automatic retries with a delay, then a `failed` state with the provider's error message
 - Per-post history (created, scheduled, retried, published, failed)
 - Multiple accounts per provider; tokens are stored encrypted
+- Up to 4 images per thread part with alt text (JPEG, PNG, GIF, WebP)
 - Links in Bluesky posts become clickable (rich text facets)
 - Admin sign-in with password plus optional TOTP two-factor authentication
 - systemd unit for production
@@ -51,7 +52,7 @@ Saving an account verifies the credentials against the provider immediately. Tok
 
 ## How publishing works
 
-The scheduler wakes up every `SCHEDULER_INTERVAL` seconds (default 15) and claims posts whose time has come. Claiming is atomic, so a post is never published twice even if two checks overlap. Each thread part is published in order; the next part replies to the previous one. On an error the post is re-queued two minutes later, up to `MAX_ATTEMPTS` times (default 3), and then marked `failed` with the error shown in the dashboard. *Publish now* on a draft, failed, or cancelled post queues it immediately.
+The scheduler wakes up every `SCHEDULER_INTERVAL` seconds (default 15) and claims posts whose time has come. Claiming is atomic, so a post is never published twice even if two checks overlap. Each thread part is published in order; the next part replies to the previous one. Images are uploaded to the provider right before the part they belong to. Bluesky accepts images up to 1 MB; the dashboard rejects larger files for Bluesky accounts when the post is saved. Uploads that are never attached to a post are deleted after 24 hours. On an error the post is re-queued two minutes later, up to `MAX_ATTEMPTS` times (default 3), and then marked `failed` with the error shown in the dashboard. *Publish now* on a draft, failed, or cancelled post queues it immediately.
 
 If a thread fails halfway, the parts that were already published stay online and the post is retried from the first part. Check the provider before retrying a partially published thread.
 
@@ -85,6 +86,7 @@ All admin endpoints are under `/api/admin` and return JSON.
 | `GET /posts`, `GET /posts/:id`, `GET /posts/stats` | List posts with their history |
 | `POST /posts`, `PUT /posts/:id` | Take `accountId`, `text` (or `segments`), `scheduledAt` (ms timestamp or null), optional `status: "draft"` |
 | `POST /posts/:id/cancel`, `POST /posts/:id/publish`, `DELETE /posts/:id` | Cancel a scheduled post, queue a post now, delete a post |
+| `POST /media?filename=a.png` (raw image body), `GET /media/:id`, `DELETE /media/:id` | Upload an image, fetch it, delete an unattached upload. Attach uploads to a post with `media: [{ id, segment, alt }]` |
 
 ## Production deployment
 
@@ -102,7 +104,7 @@ Put a reverse proxy with TLS in front of the service and set `NODE_ENV=productio
 
 ## Limitations
 
-- No media uploads yet; posts are text only.
+- Images only; no video or audio uploads.
 - No X/Twitter, LinkedIn, or Threads support.
 - No preview of how a post renders on each network.
 - The scheduler runs inside the web process; if the process is down at the scheduled time the post is published as soon as it starts again.

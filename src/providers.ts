@@ -6,6 +6,12 @@ export interface PublishedItem {
   /** Provider-specific reference needed to reply to this item (threads). */
   ref: unknown;
 }
+export interface MediaUpload {
+  data: Buffer;
+  mime: string;
+  alt: string;
+  filename: string;
+}
 export interface PublishClient {
   /** Verifies credentials and returns a human-readable identity, such as "@user@instance". */
   verify(account: Account, secrets: AccountSecrets): Promise<string>;
@@ -14,7 +20,8 @@ export interface PublishClient {
     account: Account,
     secrets: AccountSecrets,
     text: string,
-    replyTo?: PublishedItem
+    replyTo?: PublishedItem,
+    media?: MediaUpload[]
   ): Promise<PublishedItem>;
 }
 
@@ -62,7 +69,31 @@ export function mastodonClient(request: Fetch = fetch, timeoutMs = 15000): Publi
       );
       return `@${me.acct}@${new URL(account.server).hostname}`;
     },
-    async publish(account, secrets, text, replyTo) {
+    async publish(account, secrets, text, replyTo, media = []) {
+      const mediaIds: string[] = [];
+      for (const item of media) {
+        const form = new FormData();
+        form.append('file', new Blob([new Uint8Array(item.data)], { type: item.mime }), item.filename);
+        if (item.alt) form.append('description', item.alt);
+        const uploaded = await json(
+          request,
+          `${base(account.server)}/api/v2/media`,
+          { method: 'POST', headers: { Authorization: `Bearer ${secrets.token}` }, body: form },
+          timeoutMs * 4
+        );
+        // Mastodon answers 202 while it processes the file; wait until it is ready.
+        for (let i = 0; i < 20 && !uploaded.url; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          const state = await json(
+            request,
+            `${base(account.server)}/api/v1/media/${uploaded.id}`,
+            { headers: { Authorization: `Bearer ${secrets.token}` } },
+            timeoutMs
+          );
+          if (state?.url) break;
+        }
+        mediaIds.push(String(uploaded.id));
+      }
       const status = await json(
         request,
         `${base(account.server)}/api/v1/statuses`,
@@ -73,7 +104,7 @@ export function mastodonClient(request: Fetch = fetch, timeoutMs = 15000): Publi
             'content-type': 'application/json',
             'Idempotency-Key': `${account.id}-${hash(text)}-${replyTo?.id ?? 'root'}`,
           },
-          body: JSON.stringify({ status: text, in_reply_to_id: replyTo?.id ?? null }),
+          body: JSON.stringify({ status: text, in_reply_to_id: replyTo?.id ?? null, media_ids: mediaIds }),
         },
         timeoutMs
       );
@@ -130,9 +161,26 @@ export function blueskyClient(request: Fetch = fetch, timeoutMs = 15000): Publis
       const s = await session(account, secrets, true);
       return `@${s.handle}`;
     },
-    async publish(account, secrets, text, replyTo) {
-      const s = await session(account, secrets);
+    async publish(account, secrets, text, replyTo, media = []) {
+      let s = await session(account, secrets);
       const parent = replyTo?.ref as StrongRef | undefined;
+      const uploadAll = async (jwt: string) => {
+        const images = [];
+        for (const item of media) {
+          const result = await json<{ blob: unknown }>(
+            request,
+            `${base(account.server)}/xrpc/com.atproto.repo.uploadBlob`,
+            {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${jwt}`, 'content-type': item.mime },
+              body: new Uint8Array(item.data),
+            },
+            timeoutMs * 4
+          );
+          images.push({ alt: item.alt, image: result.blob });
+        }
+        return images;
+      };
       const record: Record<string, unknown> = {
         $type: 'app.bsky.feed.post',
         text,
@@ -143,8 +191,9 @@ export function blueskyClient(request: Fetch = fetch, timeoutMs = 15000): Publis
         const root = (replyTo as PublishedItem & { root?: StrongRef }).root ?? parent;
         record.reply = { root, parent };
       }
-      const attempt = (jwt: string) =>
-        json<StrongRef>(
+      const attempt = async (jwt: string) => {
+        if (media.length) record.embed = { $type: 'app.bsky.embed.images', images: await uploadAll(jwt) };
+        return json<StrongRef>(
           request,
           `${base(account.server)}/xrpc/com.atproto.repo.createRecord`,
           {
@@ -154,13 +203,15 @@ export function blueskyClient(request: Fetch = fetch, timeoutMs = 15000): Publis
           },
           timeoutMs
         );
+      };
       let created: StrongRef;
       try {
         created = await attempt(s.accessJwt);
       } catch (error) {
         // Expired session: sign in again once and retry.
         if (!(error instanceof Error && /HTTP 401/.test(error.message))) throw error;
-        created = await attempt((await session(account, secrets, true)).accessJwt);
+        s = await session(account, secrets, true);
+        created = await attempt(s.accessJwt);
       }
       const rkey = created.uri.split('/').pop();
       const root = (replyTo as (PublishedItem & { root?: StrongRef }) | undefined)?.root ?? parent ?? created;

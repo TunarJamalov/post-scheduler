@@ -2,11 +2,14 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type Database from 'better-sqlite3';
 import {
   claimDuePosts,
+  cleanupMedia,
   createPost,
+  getMedia,
   getAccountSecrets,
   getPost,
   openDatabase,
   saveAccount,
+  storeMedia,
   type Account,
 } from '../src/db.js';
 import { blueskyClient, blueskyFacets, mastodonClient, type PublishClient } from '../src/providers.js';
@@ -142,7 +145,11 @@ describe('providers', () => {
     expect(item).toMatchObject({ id: '42', url: 'https://m.example/@me/42' });
     expect(calls[1].url).toBe('https://m.example/api/v1/statuses');
     expect((calls[1].init.headers as any).Authorization).toBe('Bearer tok');
-    expect(JSON.parse(String(calls[1].init.body))).toEqual({ status: 'hello', in_reply_to_id: '41' });
+    expect(JSON.parse(String(calls[1].init.body))).toEqual({
+      status: 'hello',
+      in_reply_to_id: '41',
+      media_ids: [],
+    });
   });
   it('creates Bluesky sessions, records with facets, and threads replies to the root', async () => {
     const calls: { url: string; body: any }[] = [];
@@ -301,5 +308,155 @@ describe('HTTP API', () => {
     expect((await fetch(`${base}/api/admin/posts`, { headers: { Cookie: jar } })).status).toBe(200);
     expect((await json(base, '/api/admin/posts', 'POST', {}, { Cookie: jar })).status).toBe(403);
     server.close();
+  });
+});
+
+describe('media', () => {
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+
+  it('uploads, attaches, limits, and cleans up images', async () => {
+    const app = createServer(db, { clients: { mastodon: fakeClient([]), bluesky: fakeClient([]) } });
+    const server = app.listen(0);
+    await new Promise<void>((resolve) => server.once('listening', () => resolve()));
+    const base = `http://127.0.0.1:${(server.address() as any).port}`;
+    const account = await (
+      await fetch(`${base}/api/admin/accounts`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'B', provider: 'bluesky', identifier: 'me.bsky.social', token: 'pw' }),
+      })
+    ).json();
+    const upload = (body: Buffer, type = 'image/png') =>
+      fetch(`${base}/api/admin/media?filename=photo one.png`, {
+        method: 'POST',
+        headers: { 'content-type': type },
+        body,
+      });
+    expect((await upload(png, 'text/plain')).status).toBe(415);
+    const small = await (await upload(png)).json();
+    expect(small).toMatchObject({
+      filename: 'photo_one.png',
+      mime: 'image/png',
+      size: png.length,
+      postId: null,
+    });
+    const image = await fetch(`${base}/api/admin/media/${small.id}`);
+    expect(image.headers.get('content-type')).toContain('image/png');
+    expect(Buffer.from(await image.arrayBuffer()).equals(png)).toBe(true);
+    const big = await (await upload(Buffer.alloc(1_000_001))).json();
+    const post = (body: unknown) =>
+      fetch(`${base}/api/admin/posts`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    const tooBig = await post({
+      accountId: account.id,
+      text: 'hi',
+      media: [{ id: big.id, segment: 0, alt: 'x' }],
+    });
+    expect(tooBig.status).toBe(400);
+    expect(await tooBig.text()).toContain('bluesky allows');
+    const wrongPart = await post({
+      accountId: account.id,
+      text: 'hi',
+      media: [{ id: small.id, segment: 3 }],
+    });
+    expect(wrongPart.status).toBe(400);
+    const created = await (
+      await post({
+        accountId: account.id,
+        text: 'a\n---\nb',
+        media: [{ id: small.id, segment: 1, alt: 'A cat' }],
+      })
+    ).json();
+    expect(created.media).toHaveLength(1);
+    expect(created.media[0]).toMatchObject({ segment: 1, alt: 'A cat', postId: created.id });
+    // Attached media cannot be deleted through the media endpoint; detached media can.
+    expect((await fetch(`${base}/api/admin/media/${small.id}`, { method: 'DELETE' })).status).toBe(404);
+    expect((await fetch(`${base}/api/admin/media/${big.id}`, { method: 'DELETE' })).status).toBe(204);
+    // Deleting the post removes its media.
+    await fetch(`${base}/api/admin/posts/${created.id}`, { method: 'DELETE' });
+    expect((await fetch(`${base}/api/admin/media/${small.id}`)).status).toBe(404);
+    server.close();
+  });
+
+  it('removes stale unattached uploads', () => {
+    const item = storeMedia(db, { filename: 'a.png', mime: 'image/png', data: png });
+    expect(cleanupMedia(db, 1000, Date.now() + 500)).toBe(0);
+    expect(cleanupMedia(db, 1000, Date.now() + 2000)).toBe(1);
+    expect(getMedia(db, item.id)).toBeUndefined();
+  });
+
+  it('uploads images to Mastodon and Bluesky before posting', async () => {
+    const account = saveAccount(db, {
+      name: 'M',
+      provider: 'mastodon',
+      server: 'https://m.example',
+      identifier: '',
+      secrets: { token: 't' },
+    });
+    const item = storeMedia(db, { filename: 'a.png', mime: 'image/png', data: png });
+    const post = createPost(db, {
+      accountId: account.id,
+      segments: ['with image'],
+      scheduledAt: 1000,
+      media: [{ id: item.id, segment: 0, alt: 'alt text' }],
+    });
+    const calls: { url: string; init: any }[] = [];
+    const request = (async (url: any, init: any) => {
+      calls.push({ url: String(url), init });
+      if (String(url).endsWith('/api/v2/media'))
+        return new Response(JSON.stringify({ id: 'm1', url: 'https://m.example/media/1' }));
+      if (String(url).endsWith('uploadBlob'))
+        return new Response(JSON.stringify({ blob: { $type: 'blob', ref: { $link: 'abc' } } }));
+      if (String(url).endsWith('createSession'))
+        return new Response(JSON.stringify({ accessJwt: 'jwt', did: 'did:plc:x', handle: 'me' }));
+      if (String(url).endsWith('createRecord'))
+        return new Response(JSON.stringify({ uri: 'at://did:plc:x/app.bsky.feed.post/r1', cid: 'c1' }));
+      return new Response(JSON.stringify({ id: '9', url: 'https://m.example/@me/9' }));
+    }) as typeof fetch;
+    const results = await runDuePosts(
+      db,
+      {
+        maxAttempts: 1,
+        retryDelayMs: 0,
+        clients: { mastodon: mastodonClient(request), bluesky: blueskyClient(request) },
+      },
+      1000
+    );
+    expect(results[0].ok).toBe(true);
+    const upload = calls.find((c) => c.url.endsWith('/api/v2/media'))!;
+    expect(upload.init.body).toBeInstanceOf(FormData);
+    expect((upload.init.body as FormData).get('description')).toBe('alt text');
+    const status = calls.find((c) => c.url.endsWith('/api/v1/statuses'))!;
+    expect(JSON.parse(status.init.body).media_ids).toEqual(['m1']);
+
+    const bsky = saveAccount(db, {
+      name: 'B',
+      provider: 'bluesky',
+      server: 'https://bsky.social',
+      identifier: 'me',
+      secrets: { token: 'pw' },
+    });
+    const item2 = storeMedia(db, { filename: 'b.png', mime: 'image/png', data: png });
+    createPost(db, {
+      accountId: bsky.id,
+      segments: ['bsky image'],
+      scheduledAt: 1000,
+      media: [{ id: item2.id, segment: 0, alt: 'blue' }],
+    });
+    await runDuePosts(
+      db,
+      { maxAttempts: 1, retryDelayMs: 0, clients: { bluesky: blueskyClient(request) } },
+      2000
+    );
+    const blob = calls.find((c) => c.url.endsWith('uploadBlob'))!;
+    expect(blob.init.headers['content-type']).toBe('image/png');
+    const record = JSON.parse(calls.filter((c) => c.url.endsWith('createRecord')).pop()!.init.body).record;
+    expect(record.embed).toEqual({
+      $type: 'app.bsky.embed.images',
+      images: [{ alt: 'blue', image: { $type: 'blob', ref: { $link: 'abc' } } }],
+    });
   });
 });

@@ -33,6 +33,12 @@ form.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
 .summary{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}
 .summary span{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:13px}
 .segment{white-space:pre-wrap;border-left:3px solid var(--border);padding:4px 10px;margin:6px 0;font-size:14px}
+.thumbs{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0}
+.thumbs img{width:96px;height:96px;object-fit:cover;border-radius:6px;border:1px solid var(--border)}
+.attachment{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--border);border-radius:8px;padding:8px;margin:6px 0;background:var(--bg)}
+.attachment img{width:72px;height:72px;object-fit:cover;border-radius:6px;flex-shrink:0}
+.attachment .fields{flex:1;display:grid;gap:6px;grid-template-columns:1fr 120px auto;align-items:end}
+@media(max-width:700px){.attachment .fields{grid-template-columns:1fr}}
 .counter{font-size:12px;color:var(--muted)}.counter.over{color:var(--bad);font-weight:600}
 .msg{min-height:20px;margin:8px 0 0}.msg.error{color:var(--bad)}
 .event{font-size:13px;padding:4px 0;border-top:1px solid var(--border)}
@@ -90,7 +96,42 @@ export function loginPage() {
 
 const postsScript = `
 ${helpers}
-var accounts = [], posts = [], editing = null;
+var accounts = [], posts = [], editing = null, attachments = [];
+function partOptions(selected) {
+  var count = Math.max(1, splitThread($('text').value).length), out = '';
+  for (var i = 0; i < count; i++) out += '<option value="' + i + '"' + (i === selected ? ' selected' : '') + '>Part ' + (i + 1) + '</option>';
+  return out;
+}
+function renderAttachments() {
+  $('attachments').innerHTML = attachments.map(function (a, i) {
+    return '<div class="attachment" data-index="' + i + '"><img src="/api/admin/media/' + esc(a.id) + '" alt=""><div class="fields"><label>Alt text<input data-field="alt" value="' + esc(a.alt) + '" placeholder="Describe the image"></label><label>Attach to<select data-field="segment">' + partOptions(a.segment) + '</select></label><button type="button" data-remove>Remove</button></div></div>';
+  }).join('');
+}
+$('attachments').oninput = function (e) {
+  var box = e.target.closest('[data-index]'); if (!box) return;
+  var a = attachments[Number(box.getAttribute('data-index'))], field = e.target.getAttribute('data-field');
+  if (field === 'alt') a.alt = e.target.value; if (field === 'segment') a.segment = Number(e.target.value);
+};
+$('attachments').onclick = function (e) {
+  var button = e.target.closest('[data-remove]'); if (!button) return;
+  var box = button.closest('[data-index]'), i = Number(box.getAttribute('data-index'));
+  var a = attachments.splice(i, 1)[0];
+  if (!editing) fetch('/api/admin/media/' + a.id, { method: 'DELETE', headers: { 'x-csrf-token': csrf() } });
+  renderAttachments();
+};
+$('images').onchange = async function () {
+  var files = Array.from($('images').files);
+  $('images').value = '';
+  for (var i = 0; i < files.length; i++) {
+    var file = files[i];
+    if (attachments.length >= 16) { showMessage('post-message', 'Too many images', true); break; }
+    var r = await fetch('/api/admin/media?filename=' + encodeURIComponent(file.name), { method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream', 'x-csrf-token': csrf() }, body: file });
+    if (!r.ok) { showMessage('post-message', file.name + ': ' + (await r.text()), true); continue; }
+    var item = await r.json();
+    attachments.push({ id: item.id, alt: '', segment: Math.max(0, splitThread($('text').value).length - 1), filename: item.filename, size: item.size });
+  }
+  renderAttachments();
+};
 function accountName(id) { var a = accounts.find(function (x) { return x.id === id; }); return a ? a.name + ' (' + a.provider + ')' : 'deleted account'; }
 function provider() { var a = accounts.find(function (x) { return x.id === $('accountId').value; }); return a ? a.provider : 'mastodon'; }
 function updateCounter() {
@@ -99,12 +140,14 @@ function updateCounter() {
   $('counter').textContent = segments.length ? parts.join(' · ') + (segments.length > 1 ? ' · ' + segments.length + '-part thread' : '') : 'Separate thread parts with a line containing only ---';
   $('counter').className = 'counter' + (over ? ' over' : '');
 }
-$('text').oninput = updateCounter; $('accountId').onchange = updateCounter;
+$('text').oninput = function () { updateCounter(); renderAttachments(); }; $('accountId').onchange = updateCounter;
 function fillForm(p) {
   editing = p ? p.id : null;
   $('accountId').value = p ? p.accountId : (accounts[0] ? accounts[0].id : '');
   $('text').value = p ? p.segments.join('\\n\\n---\\n\\n') : '';
   $('scheduledAt').value = p && p.scheduledAt ? toLocalInput(p.scheduledAt) : '';
+  attachments = p ? (p.media || []).map(function (m) { return { id: m.id, alt: m.alt, segment: m.segment, filename: m.filename, size: m.size }; }) : [];
+  renderAttachments();
   $('form-title').textContent = p ? 'Edit post' : 'New post';
   $('cancel').classList.toggle('hidden', !p);
   updateCounter();
@@ -112,7 +155,7 @@ function fillForm(p) {
 }
 async function submit(action) {
   var scheduledAt = $('scheduledAt').value ? new Date($('scheduledAt').value).getTime() : null;
-  var body = { accountId: $('accountId').value, text: $('text').value, scheduledAt: action === 'now' ? Date.now() : scheduledAt, status: action === 'draft' ? 'draft' : undefined };
+  var body = { accountId: $('accountId').value, text: $('text').value, scheduledAt: action === 'now' ? Date.now() : scheduledAt, status: action === 'draft' ? 'draft' : undefined, media: attachments.map(function (a) { return { id: a.id, segment: a.segment, alt: a.alt }; }) };
   if (action === 'schedule' && !scheduledAt) { showMessage('post-message', 'Choose a date and time to schedule, or save as draft', true); return; }
   var r = await api('/api/admin/posts' + (editing ? '/' + editing : ''), editing ? 'PUT' : 'POST', body);
   if (r.ok) { showMessage('post-message', action === 'now' ? 'Publishing now' : action === 'draft' ? 'Draft saved' : 'Post scheduled'); fillForm(null); load(); }
@@ -123,7 +166,10 @@ $('save-draft').onclick = function () { submit('draft'); };
 $('publish-now').onclick = function () { if (confirm('Publish immediately?')) submit('now'); };
 $('cancel').onclick = function () { fillForm(null); showMessage('post-message', ''); };
 function card(p) {
-  var segments = p.segments.map(function (s) { return '<div class="segment">' + esc(s) + '</div>'; }).join('');
+  var segments = p.segments.map(function (s, i) {
+    var imgs = (p.media || []).filter(function (m) { return m.segment === i; }).map(function (m) { return '<img src="/api/admin/media/' + esc(m.id) + '" alt="' + esc(m.alt) + '" title="' + esc(m.alt || m.filename) + '">'; }).join('');
+    return '<div class="segment">' + esc(s) + (imgs ? '<div class="thumbs">' + imgs + '</div>' : '') + '</div>';
+  }).join('');
   var meta = [];
   if (p.status === 'scheduled') meta.push('Scheduled for ' + esc(when(p.scheduledAt)));
   if (p.status === 'published') meta.push('Published ' + esc(when(p.publishedAt)) + (p.remoteUrl ? ' · <a href="' + esc(p.remoteUrl) + '" target="_blank" rel="noopener">Open</a>' : ''));
@@ -178,6 +224,8 @@ export function postsPage() {
 <label>Account<select id="accountId" required></select></label>
 <label>Schedule (local time)<input id="scheduledAt" type="datetime-local"></label>
 <label class="full">Text<textarea id="text" placeholder="Write your post. Put --- on its own line to start the next part of a thread." required></textarea><span id="counter" class="counter"></span></label>
+<label class="full">Images (JPEG, PNG, GIF, WebP; up to 4 per part, 1 MB each on Bluesky)<input id="images" type="file" accept="image/jpeg,image/png,image/gif,image/webp" multiple></label>
+<div id="attachments" class="full"></div>
 <div class="full actions"><button class="primary">Schedule</button><button type="button" id="save-draft">Save draft</button><button type="button" id="publish-now">Publish now</button><button type="button" id="cancel" class="hidden">Cancel edit</button></div>
 </form><p id="post-message" class="msg"></p></section>
 <div class="row"><h2>Posts</h2><label style="width:180px">Show<select id="filter"><option value="all">All</option><option value="scheduled">Scheduled</option><option value="draft">Drafts</option><option value="published">Published</option><option value="failed">Failed</option></select></label></div>
