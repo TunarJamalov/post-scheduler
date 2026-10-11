@@ -1,0 +1,11 @@
+services:
+  post-scheduler:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    env_file: .env
+    environment:
+      DATABASE_PATH: /app/data/posts.db
+    volumes:
+      - ./data:/app/data

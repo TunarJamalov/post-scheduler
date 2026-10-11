@@ -88,6 +88,15 @@ All admin endpoints are under `/api/admin` and return JSON.
 | `POST /posts/:id/cancel`, `POST /posts/:id/publish`, `DELETE /posts/:id` | Cancel a scheduled post, queue a post now, delete a post |
 | `POST /media?filename=a.png` (raw image body), `GET /media/:id`, `DELETE /media/:id` | Upload an image, fetch it, delete an unattached upload. Attach uploads to a post with `media: [{ id, segment, alt }]` |
 
+## Docker
+
+```sh
+cp .env.example .env   # edit it, then:
+docker compose up -d --build
+```
+
+The container stores the database in `./data` and listens on port 3100. The compose file passes `.env` to the container, so `DATABASE_PATH` in `.env` is overridden to the volume path.
+
 ## Production deployment
 
 ```sh
