@@ -33,6 +33,9 @@ form.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
 .summary{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}
 .summary span{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:13px}
 .segment{white-space:pre-wrap;border-left:3px solid var(--border);padding:4px 10px;margin:6px 0;font-size:14px}
+.checks{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:6px}
+.checks label{display:inline-flex;align-items:center;gap:6px;font-size:14px}
+.checks input{width:auto;margin:0}
 .thumbs{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0}
 .thumbs img{width:96px;height:96px;object-fit:cover;border-radius:6px;border:1px solid var(--border)}
 .attachment{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--border);border-radius:8px;padding:8px;margin:6px 0;background:var(--bg)}
@@ -133,17 +136,33 @@ $('images').onchange = async function () {
   renderAttachments();
 };
 function accountName(id) { var a = accounts.find(function (x) { return x.id === id; }); return a ? a.name + ' (' + a.provider + ')' : 'deleted account'; }
-function provider() { var a = accounts.find(function (x) { return x.id === $('accountId').value; }); return a ? a.provider : 'mastodon'; }
+var settings = { queueSlots: [], nextSlots: {} };
+function selectedIds() { return Array.from(document.querySelectorAll('#accounts-box input:checked')).map(function (el) { return el.value; }); }
+function limitFor(ids) {
+  var limit = Infinity;
+  ids.forEach(function (id) { var a = accounts.find(function (x) { return x.id === id; }); if (a && LIMITS[a.provider] < limit) limit = LIMITS[a.provider]; });
+  return limit === Infinity ? LIMITS.mastodon : limit;
+}
+function renderAccounts() {
+  $('accounts-box').innerHTML = accounts.map(function (a) {
+    var next = settings.nextSlots[a.id] ? ' · next queue slot ' + when(settings.nextSlots[a.id]) : '';
+    return '<label><input type="' + (editing ? 'radio' : 'checkbox') + '" name="account" value="' + esc(a.id) + '"' + (editing ? ' disabled' : '') + '> ' + esc(a.name) + ' <span class="muted">(' + esc(a.provider) + next + ')</span></label>';
+  }).join('') || '<span class="muted">No accounts yet.</span>';
+}
 function updateCounter() {
-  var segments = splitThread($('text').value), limit = LIMITS[provider()], over = false;
+  var segments = splitThread($('text').value), limit = limitFor(selectedIds()), over = false;
   var parts = segments.map(function (s, i) { var n = countChars(s); if (n > limit) over = true; return 'Part ' + (i + 1) + ': ' + n + '/' + limit; });
   $('counter').textContent = segments.length ? parts.join(' · ') + (segments.length > 1 ? ' · ' + segments.length + '-part thread' : '') : 'Separate thread parts with a line containing only ---';
   $('counter').className = 'counter' + (over ? ' over' : '');
 }
-$('text').oninput = function () { updateCounter(); renderAttachments(); }; $('accountId').onchange = updateCounter;
+$('text').oninput = function () { updateCounter(); renderAttachments(); }; $('accounts-box').onchange = updateCounter;
 function fillForm(p) {
   editing = p ? p.id : null;
-  $('accountId').value = p ? p.accountId : (accounts[0] ? accounts[0].id : '');
+  renderAccounts();
+  document.querySelectorAll('#accounts-box input').forEach(function (el) {
+    el.checked = p ? el.value === p.accountId : accounts.length === 1;
+    if (p) el.disabled = el.value !== p.accountId;
+  });
   $('text').value = p ? p.segments.join('\\n\\n---\\n\\n') : '';
   $('scheduledAt').value = p && p.scheduledAt ? toLocalInput(p.scheduledAt) : '';
   attachments = p ? (p.media || []).map(function (m) { return { id: m.id, alt: m.alt, segment: m.segment, filename: m.filename, size: m.size }; }) : [];
@@ -155,14 +174,29 @@ function fillForm(p) {
 }
 async function submit(action) {
   var scheduledAt = $('scheduledAt').value ? new Date($('scheduledAt').value).getTime() : null;
-  var body = { accountId: $('accountId').value, text: $('text').value, scheduledAt: action === 'now' ? Date.now() : scheduledAt, status: action === 'draft' ? 'draft' : undefined, media: attachments.map(function (a) { return { id: a.id, segment: a.segment, alt: a.alt }; }) };
+  var ids = selectedIds();
+  if (!ids.length) { showMessage('post-message', 'Choose at least one account', true); return; }
+  var body = { accountIds: ids, text: $('text').value, scheduledAt: action === 'now' ? Date.now() : action === 'queue' ? 'queue' : scheduledAt, status: action === 'draft' ? 'draft' : undefined, media: attachments.map(function (a) { return { id: a.id, segment: a.segment, alt: a.alt }; }) };
   if (action === 'schedule' && !scheduledAt) { showMessage('post-message', 'Choose a date and time to schedule, or save as draft', true); return; }
   var r = await api('/api/admin/posts' + (editing ? '/' + editing : ''), editing ? 'PUT' : 'POST', body);
-  if (r.ok) { showMessage('post-message', action === 'now' ? 'Publishing now' : action === 'draft' ? 'Draft saved' : 'Post scheduled'); fillForm(null); load(); }
+  if (r.ok) {
+    var result = await r.json(), list = result.created || [result];
+    var slots = list.filter(function (p) { return p.scheduledAt; }).map(function (p) { return accountName(p.accountId) + ': ' + when(p.scheduledAt); });
+    showMessage('post-message', (action === 'now' ? 'Publishing now' : action === 'draft' ? 'Draft saved' : action === 'queue' ? 'Added to queue' : 'Post scheduled') + (list.length > 1 ? ' for ' + list.length + ' accounts' : '') + (slots.length && action !== 'now' ? ' · ' + slots.join(' · ') : ''));
+    fillForm(null); load();
+  }
   else showMessage('post-message', await r.text(), true);
 }
 $('post-form').onsubmit = function (e) { e.preventDefault(); submit('schedule'); };
 $('save-draft').onclick = function () { submit('draft'); };
+$('add-queue').onclick = function () { submit('queue'); };
+$('queue-form').onsubmit = async function (e) {
+  e.preventDefault();
+  var slots = $('queueSlots').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+  var r = await api('/api/admin/settings', 'PUT', { queueSlots: slots });
+  showMessage('queue-message', r.ok ? 'Queue times saved' : await r.text(), !r.ok);
+  load();
+};
 $('publish-now').onclick = function () { if (confirm('Publish immediately?')) submit('now'); };
 $('cancel').onclick = function () { fillForm(null); showMessage('post-message', ''); };
 function card(p) {
@@ -193,8 +227,15 @@ function render() {
 $('filter').onchange = render;
 async function load() {
   accounts = await (await api('/api/admin/accounts')).json();
-  $('accountId').innerHTML = accounts.map(function (a) { return '<option value="' + esc(a.id) + '">' + esc(a.name) + ' (' + esc(a.provider) + ')</option>'; }).join('');
-  if (!editing && !$('text').value) $('accountId').value = accounts[0] ? accounts[0].id : '';
+  settings = await (await api('/api/admin/settings')).json();
+  var checked = selectedIds();
+  renderAccounts();
+  document.querySelectorAll('#accounts-box input').forEach(function (el) {
+    el.checked = checked.length ? checked.indexOf(el.value) >= 0 : (editing ? false : accounts.length === 1);
+    if (editing) { var p = posts.find(function (x) { return x.id === editing; }); if (p) { el.checked = el.value === p.accountId; el.disabled = el.value !== p.accountId; } }
+  });
+  if (document.activeElement !== $('queueSlots')) $('queueSlots').value = settings.queueSlots.join(', ');
+  $('queue-tz').textContent = 'Server time zone: ' + settings.timeZone;
   posts = await (await api('/api/admin/posts')).json();
   render(); updateCounter();
 }
@@ -221,13 +262,15 @@ export function postsPage() {
     'Posts',
     `<h1>Post scheduler</h1>${nav('/dashboard')}<div id="summary" class="summary"></div>
 <section class="panel"><h2 id="form-title">New post</h2><form id="post-form" class="grid">
-<label>Account<select id="accountId" required></select></label>
+<div class="full"><span class="muted">Accounts (one post is created per selected account)</span><div id="accounts-box" class="checks"></div></div>
 <label>Schedule (local time)<input id="scheduledAt" type="datetime-local"></label>
+<div></div>
 <label class="full">Text<textarea id="text" placeholder="Write your post. Put --- on its own line to start the next part of a thread." required></textarea><span id="counter" class="counter"></span></label>
 <label class="full">Images (JPEG, PNG, GIF, WebP; up to 4 per part, 1 MB each on Bluesky)<input id="images" type="file" accept="image/jpeg,image/png,image/gif,image/webp" multiple></label>
 <div id="attachments" class="full"></div>
-<div class="full actions"><button class="primary">Schedule</button><button type="button" id="save-draft">Save draft</button><button type="button" id="publish-now">Publish now</button><button type="button" id="cancel" class="hidden">Cancel edit</button></div>
+<div class="full actions"><button class="primary">Schedule</button><button type="button" id="add-queue">Add to queue</button><button type="button" id="save-draft">Save draft</button><button type="button" id="publish-now">Publish now</button><button type="button" id="cancel" class="hidden">Cancel edit</button></div>
 </form><p id="post-message" class="msg"></p></section>
+<details class="panel"><summary>Queue times</summary><form id="queue-form" class="grid" style="margin-top:10px"><label class="full">Daily posting times, comma separated (HH:MM)<input id="queueSlots" placeholder="09:00, 13:00, 18:00"></label><p class="full muted" id="queue-tz"></p><div class="full actions"><button class="primary">Save queue times</button></div></form><p id="queue-message" class="msg"></p></details>
 <div class="row"><h2>Posts</h2><label style="width:180px">Show<select id="filter"><option value="all">All</option><option value="scheduled">Scheduled</option><option value="draft">Drafts</option><option value="published">Published</option><option value="failed">Failed</option></select></label></div>
 <div id="posts"></div>`,
     postsScript

@@ -21,6 +21,7 @@ import {
   MAX_IMAGES_PER_PART,
   MEDIA_LIMITS,
   cleanupMedia,
+  copyMedia,
   createPost,
   getAccount,
   getMedia,
@@ -32,7 +33,10 @@ import {
   getPost,
   listAccounts,
   listPosts,
+  nextQueueSlot,
   postEvents,
+  queueSlots,
+  saveQueueSlots,
   removeAccount,
   removePost,
   retryPost,
@@ -87,19 +91,32 @@ function parseAccount(body: any) {
   return { name, provider: provider as Provider, server: url.origin, identifier, token };
 }
 
+/**
+ * Parses a post payload. `accountIds` (or a single `accountId`) selects the target accounts;
+ * segments and images are validated against every selected provider. `scheduledAt` may be a
+ * timestamp in milliseconds, null (draft), or the string "queue" for the next free queue slot.
+ */
 function parsePost(db: Database.Database, body: any) {
-  const accountId = typeof body?.accountId === 'string' ? body.accountId : '';
-  const account = getAccount(db, accountId);
-  if (!account) throw new Error('Choose an existing account');
-  const segments = Array.isArray(body.segments)
+  const ids: string[] = Array.isArray(body?.accountIds)
+    ? body.accountIds.map(String)
+    : typeof body?.accountId === 'string'
+      ? [body.accountId]
+      : [];
+  const accounts = [...new Set(ids)].map((id) => getAccount(db, id));
+  if (!accounts.length || accounts.some((a) => !a)) throw new Error('Choose at least one existing account');
+  const segments: string[] = Array.isArray(body.segments)
     ? body.segments.map((s: unknown) => String(s).trim()).filter(Boolean)
     : splitThread(typeof body.text === 'string' ? body.text : '');
-  const problem = validateSegments(segments, account.provider);
-  if (problem) throw new Error(problem);
-  const scheduledAt = body.scheduledAt == null || body.scheduledAt === '' ? null : Number(body.scheduledAt);
+  for (const account of accounts) {
+    const problem = validateSegments(segments, account!.provider);
+    if (problem) throw new Error(problem);
+  }
+  const queue = body.scheduledAt === 'queue';
+  const scheduledAt =
+    queue || body.scheduledAt == null || body.scheduledAt === '' ? null : Number(body.scheduledAt);
   if (scheduledAt !== null && !Number.isFinite(scheduledAt))
-    throw new Error('scheduledAt must be a timestamp in milliseconds');
-  const status = body.status === 'draft' ? 'draft' : scheduledAt ? 'scheduled' : 'draft';
+    throw new Error('scheduledAt must be a timestamp in milliseconds, null, or "queue"');
+  const status = body.status === 'draft' ? 'draft' : queue || scheduledAt ? 'scheduled' : 'draft';
   const media = Array.isArray(body.media) ? body.media : [];
   const perSegment = new Map<number, number>();
   const attachments = media.map((m: any) => {
@@ -108,16 +125,26 @@ function parsePost(db: Database.Database, body: any) {
     const segment = Number(m.segment ?? 0);
     if (!Number.isInteger(segment) || segment < 0 || segment >= segments.length)
       throw new Error('An image is attached to a thread part that does not exist');
-    if (item.size > MEDIA_LIMITS[account.provider])
-      throw new Error(
-        `${item.filename} is ${(item.size / 1024).toFixed(0)} KB; ${account.provider} allows ${(MEDIA_LIMITS[account.provider] / 1024).toFixed(0)} KB per image`
-      );
+    for (const account of accounts) {
+      const limit = MEDIA_LIMITS[account!.provider];
+      if (item.size > limit)
+        throw new Error(
+          `${item.filename} is ${(item.size / 1024).toFixed(0)} KB; ${account!.provider} allows ${(limit / 1024).toFixed(0)} KB per image`
+        );
+    }
     perSegment.set(segment, (perSegment.get(segment) ?? 0) + 1);
     if (perSegment.get(segment)! > MAX_IMAGES_PER_PART)
       throw new Error(`At most ${MAX_IMAGES_PER_PART} images per part`);
     return { id: item.id, segment, alt: typeof m.alt === 'string' ? m.alt.trim().slice(0, 1500) : '' };
   });
-  return { accountId, segments, scheduledAt, status: status as 'draft' | 'scheduled', media: attachments };
+  return {
+    accountIds: accounts.map((a) => a!.id),
+    segments,
+    scheduledAt,
+    queue,
+    status: status as 'draft' | 'scheduled',
+    media: attachments as { id: string; segment: number; alt: string }[],
+  };
 }
 
 export function createServer(db: Database.Database, options: ServerOptions = {}) {
@@ -297,6 +324,22 @@ export function createServer(db: Database.Database, options: ServerOptions = {})
     r.sendStatus(204);
   });
 
+  app.get('/api/admin/settings', (_q, r) => {
+    const slots = queueSlots(db);
+    r.json({
+      queueSlots: slots,
+      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      nextSlots: Object.fromEntries(listAccounts(db).map((a) => [a.id, nextQueueSlot(db, a.id, slots)])),
+    });
+  });
+  app.put('/api/admin/settings', (q, r) => {
+    try {
+      r.json({ queueSlots: saveQueueSlots(db, q.body?.queueSlots) });
+    } catch (e) {
+      badRequest(r, e);
+    }
+  });
+
   const withEvents = (post: ReturnType<typeof getPost>) =>
     post ? { ...post, events: postEvents(db, post.id), media: postMedia(db, post.id) } : undefined;
 
@@ -333,9 +376,26 @@ export function createServer(db: Database.Database, options: ServerOptions = {})
   });
   app.post('/api/admin/posts', (q, r) => {
     try {
-      const post = createPost(db, parsePost(db, q.body));
+      const input = parsePost(db, q.body);
+      const slots = queueSlots(db);
+      const created = db.transaction(() =>
+        input.accountIds.map((accountId, index) => {
+          // The first post keeps the uploaded images; cross-posts get their own copies.
+          const media =
+            index === 0 ? input.media : input.media.map((m) => ({ ...m, id: copyMedia(db, m.id).id }));
+          const scheduledAt = input.queue ? nextQueueSlot(db, accountId, slots) : input.scheduledAt;
+          return createPost(db, {
+            accountId,
+            segments: input.segments,
+            scheduledAt,
+            status: input.status,
+            media,
+          });
+        })
+      )();
       onChanged();
-      r.status(201).json(withEvents(post));
+      const posts = created.map((p) => withEvents(p));
+      r.status(201).json(posts.length === 1 ? posts[0] : { created: posts });
     } catch (e) {
       badRequest(r, e);
     }
@@ -343,7 +403,10 @@ export function createServer(db: Database.Database, options: ServerOptions = {})
   app.put('/api/admin/posts/:id', (q, r) => {
     if (!getPost(db, q.params.id)) return r.sendStatus(404);
     try {
-      const post = updatePost(db, q.params.id, parsePost(db, q.body));
+      const input = parsePost(db, q.body);
+      if (input.accountIds.length !== 1) throw new Error('An existing post belongs to exactly one account');
+      const scheduledAt = input.queue ? nextQueueSlot(db, input.accountIds[0]) : input.scheduledAt;
+      const post = updatePost(db, q.params.id, { ...input, accountId: input.accountIds[0], scheduledAt });
       onChanged();
       r.json(withEvents(post));
     } catch (e) {

@@ -8,7 +8,8 @@ A small, self-hosted alternative to hosted post schedulers such as Typefully. Wr
 
 - Compose posts with a live character counter per provider (500 for Mastodon, 300 for Bluesky)
 - Threads: separate parts with a line containing only `---`; each part is published as a reply to the previous one
-- Schedule for a date and time, save as draft, or publish immediately
+- Schedule for a date and time, add to the queue (next free daily slot), save as draft, or publish immediately
+- Cross-post: select several accounts and one post is created for each, validated against every network's limits
 - Automatic retries with a delay, then a `failed` state with the provider's error message
 - Per-post history (created, scheduled, retried, published, failed)
 - Multiple accounts per provider; tokens are stored encrypted
@@ -56,6 +57,10 @@ The scheduler wakes up every `SCHEDULER_INTERVAL` seconds (default 15) and claim
 
 If a thread fails halfway, the parts that were already published stay online and the post is retried from the first part. Check the provider before retrying a partially published thread.
 
+## Queue
+
+Instead of picking a time, *Add to queue* places the post in the next free daily slot for that account. The slots default to 09:00, 13:00, and 18:00 in the server's time zone and can be changed under *Queue times* on the posts page. A slot is free when no other scheduled post of the same account uses it.
+
 ## Admin authentication
 
 `AUTH_ENCRYPTION_KEY` is always required because it protects stored account tokens. Set `ADMIN_USERNAME` and `ADMIN_PASSWORD` to require sign-in for `/dashboard` and `/api/admin/*`. Sessions last 8 hours, state-changing requests need the CSRF token the dashboard sends automatically, and failed sign-ins are rate limited. Enable TOTP on `/dashboard/security` and keep the recovery codes offline.
@@ -84,7 +89,8 @@ All admin endpoints are under `/api/admin` and return JSON.
 | `GET /accounts`, `POST /accounts`, `PUT /accounts/:id`, `DELETE /accounts/:id` | Manage accounts. `POST`/`PUT` take `name`, `provider`, `server`, `identifier`, `token` and verify the credentials |
 | `POST /accounts/:id/verify` | Re-check stored credentials |
 | `GET /posts`, `GET /posts/:id`, `GET /posts/stats` | List posts with their history |
-| `POST /posts`, `PUT /posts/:id` | Take `accountId`, `text` (or `segments`), `scheduledAt` (ms timestamp or null), optional `status: "draft"` |
+| `POST /posts`, `PUT /posts/:id` | Take `accountIds` (or `accountId`), `text` (or `segments`), `scheduledAt` (ms timestamp, `null`, or `"queue"`), optional `status: "draft"`, optional `media`. With several accounts `POST` returns `{ created: [...] }` |
+| `GET /settings`, `PUT /settings` | Queue times (`queueSlots`, HH:MM) and the next free slot per account |
 | `POST /posts/:id/cancel`, `POST /posts/:id/publish`, `DELETE /posts/:id` | Cancel a scheduled post, queue a post now, delete a post |
 | `POST /media?filename=a.png` (raw image body), `GET /media/:id`, `DELETE /media/:id` | Upload an image, fetch it, delete an unattached upload. Attach uploads to a post with `media: [{ id, segment, alt }]` |
 

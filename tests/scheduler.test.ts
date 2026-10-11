@@ -5,6 +5,9 @@ import {
   cleanupMedia,
   createPost,
   getMedia,
+  nextQueueSlot,
+  queueSlots,
+  saveQueueSlots,
   getAccountSecrets,
   getPost,
   openDatabase,
@@ -458,5 +461,103 @@ describe('media', () => {
       $type: 'app.bsky.embed.images',
       images: [{ alt: 'blue', image: { $type: 'blob', ref: { $link: 'abc' } } }],
     });
+  });
+});
+
+describe('cross-posting and queue', () => {
+  it('computes the next free queue slot per account and validates slot times', () => {
+    const account = saveAccount(db, {
+      name: 'M',
+      provider: 'mastodon',
+      server: 'https://m.example',
+      identifier: '',
+      secrets: { token: 't' },
+    });
+    expect(() => saveQueueSlots(db, ['25:00'])).toThrow('HH:MM');
+    expect(() => saveQueueSlots(db, [])).toThrow('at least one');
+    expect(saveQueueSlots(db, ['18:00', '09:00', '09:00'])).toEqual(['09:00', '18:00']);
+    const now = new Date(2026, 0, 1, 10, 0).getTime();
+    const first = nextQueueSlot(db, account.id, queueSlots(db), now);
+    expect(new Date(first).getHours()).toBe(18);
+    createPost(db, { accountId: account.id, segments: ['taken'], scheduledAt: first });
+    const second = nextQueueSlot(db, account.id, queueSlots(db), now);
+    expect(new Date(second).getDate()).toBe(2);
+    expect(new Date(second).getHours()).toBe(9);
+  });
+
+  it('creates one post per account with copied images and queue scheduling', async () => {
+    const app = createServer(db, { clients: { mastodon: fakeClient([]), bluesky: fakeClient([]) } });
+    const server = app.listen(0);
+    await new Promise<void>((resolve) => server.once('listening', () => resolve()));
+    const base = `http://127.0.0.1:${(server.address() as any).port}`;
+    const json = (path: string, method: string, body?: unknown) =>
+      fetch(`${base}${path}`, {
+        method,
+        headers: { 'content-type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    const mastodon = await (
+      await json('/api/admin/accounts', 'POST', {
+        name: 'M',
+        provider: 'mastodon',
+        server: 'https://m.example',
+        token: 't',
+      })
+    ).json();
+    const bluesky = await (
+      await json('/api/admin/accounts', 'POST', {
+        name: 'B',
+        provider: 'bluesky',
+        identifier: 'me.bsky.social',
+        token: 'pw',
+      })
+    ).json();
+    const tooLong = await json('/api/admin/posts', 'POST', {
+      accountIds: [mastodon.id, bluesky.id],
+      text: 'x'.repeat(301),
+    });
+    expect(await tooLong.text()).toContain('bluesky allows 300');
+    const image = await (
+      await fetch(`${base}/api/admin/media?filename=a.png`, {
+        method: 'POST',
+        headers: { 'content-type': 'image/png' },
+        body: Buffer.from('png'),
+      })
+    ).json();
+    const result = await (
+      await json('/api/admin/posts', 'POST', {
+        accountIds: [mastodon.id, bluesky.id],
+        text: 'hello',
+        scheduledAt: 'queue',
+        media: [{ id: image.id, segment: 0, alt: 'pic' }],
+      })
+    ).json();
+    expect(result.created).toHaveLength(2);
+    expect(result.created.map((p: any) => p.accountId).sort()).toEqual([mastodon.id, bluesky.id].sort());
+    expect(result.created.every((p: any) => p.status === 'scheduled' && p.scheduledAt > Date.now())).toBe(
+      true
+    );
+    expect(result.created[0].media[0].id).toBe(image.id);
+    expect(result.created[1].media[0].id).not.toBe(image.id);
+    expect(result.created[1].media[0].alt).toBe('pic');
+    const settings = await (await fetch(`${base}/api/admin/settings`)).json();
+    expect(settings.queueSlots).toEqual(['09:00', '13:00', '18:00']);
+    expect(settings.nextSlots[mastodon.id]).toBeGreaterThan(result.created[0].scheduledAt);
+    expect((await json('/api/admin/settings', 'PUT', { queueSlots: ['bad'] })).status).toBe(400);
+    const single = await (
+      await json('/api/admin/posts', 'POST', { accountId: mastodon.id, text: 'solo' })
+    ).json();
+    expect(single.status).toBe('draft');
+    expect(
+      (
+        await json(`/api/admin/posts/${single.id}`, 'PUT', {
+          accountIds: [mastodon.id, bluesky.id],
+          text: 'solo',
+        })
+      ).status
+    ).toBe(400);
+    const html = await (await fetch(`${base}/dashboard`)).text();
+    expect(() => new Function(html.match(/<script>([\s\S]*)<\/script>/)![1])).not.toThrow();
+    server.close();
   });
 });

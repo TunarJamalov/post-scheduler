@@ -117,6 +117,7 @@ export function openDatabase(filename: string): Database.Database {
       data BLOB NOT NULL,
       created_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS posts_due ON posts(status, scheduled_at);
     CREATE INDEX IF NOT EXISTS media_post ON media(post_id, segment, position);
     CREATE INDEX IF NOT EXISTS post_events_post ON post_events(post_id, at);
@@ -375,4 +376,86 @@ export function stats(db: Database.Database) {
     count: number;
   }[];
   return Object.fromEntries(rows.map((r) => [r.status, r.count])) as Partial<Record<PostStatus, number>>;
+}
+
+/* ---------- Settings ---------- */
+export function getSetting<T>(db: Database.Database, key: string, fallback: T): T {
+  const row = db.prepare('SELECT value FROM settings WHERE key=?').get(key) as { value: string } | undefined;
+  if (!row) return fallback;
+  try {
+    return JSON.parse(row.value) as T;
+  } catch {
+    return fallback;
+  }
+}
+export function setSetting(db: Database.Database, key: string, value: unknown) {
+  db.prepare(
+    'INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value'
+  ).run(key, JSON.stringify(value));
+}
+
+/* ---------- Queue ---------- */
+export const DEFAULT_QUEUE_SLOTS = ['09:00', '13:00', '18:00'];
+const SLOT_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+export function queueSlots(db: Database.Database): string[] {
+  return getSetting<string[]>(db, 'queueSlots', DEFAULT_QUEUE_SLOTS);
+}
+/** Validates and stores the daily queue times (HH:MM, server local time). */
+export function saveQueueSlots(db: Database.Database, slots: unknown): string[] {
+  if (!Array.isArray(slots)) throw new Error('queueSlots must be a list of HH:MM times');
+  const cleaned = [...new Set(slots.map((s) => String(s).trim()))].filter(Boolean).sort();
+  if (!cleaned.length) throw new Error('Add at least one queue time');
+  const bad = cleaned.find((s) => !SLOT_PATTERN.test(s));
+  if (bad) throw new Error(`"${bad}" is not a valid HH:MM time`);
+  setSetting(db, 'queueSlots', cleaned);
+  return cleaned;
+}
+/**
+ * Finds the next queue slot after `now` that has no scheduled post for the account.
+ * Times are interpreted in the server's local time zone.
+ */
+export function nextQueueSlot(
+  db: Database.Database,
+  accountId: string,
+  slots = queueSlots(db),
+  now = Date.now()
+): number {
+  const taken = new Set(
+    (
+      db
+        .prepare(
+          "SELECT scheduled_at as at FROM posts WHERE account_id=? AND status='scheduled' AND scheduled_at>?"
+        )
+        .all(accountId, now) as { at: number }[]
+    ).map((r) => r.at)
+  );
+  const start = new Date(now);
+  for (let day = 0; day < 366; day++) {
+    for (const slot of slots) {
+      const [h, m] = slot.split(':').map(Number);
+      const candidate = new Date(
+        start.getFullYear(),
+        start.getMonth(),
+        start.getDate() + day,
+        h,
+        m,
+        0,
+        0
+      ).getTime();
+      if (candidate > now && !taken.has(candidate)) return candidate;
+    }
+  }
+  throw new Error('No free queue slot found');
+}
+
+/** Duplicates an uploaded image so a cross-posted post gets its own attachment. */
+export function copyMedia(db: Database.Database, id: string): MediaItem {
+  const source = db.prepare('SELECT filename,mime,size,alt,data FROM media WHERE id=?').get(id) as any;
+  if (!source) throw new Error(`Unknown media ${id}`);
+  const copy = randomUUID();
+  db.prepare(
+    'INSERT INTO media (id,post_id,segment,position,filename,mime,size,alt,data,created_at) VALUES (?,NULL,0,0,?,?,?,?,?,?)'
+  ).run(copy, source.filename, source.mime, source.size, source.alt, source.data, Date.now());
+  return getMedia(db, copy)!;
 }
