@@ -4,6 +4,8 @@ A small, self-hosted alternative to hosted post schedulers such as Typefully. Wr
 
 > Status: early development. Mastodon and Bluesky publishing work. X/Twitter is not supported.
 
+![Post scheduler dashboard](docs/dashboard.png)
+
 ## Features
 
 - Compose posts with a live character counter per provider (500 for Mastodon, 300 for Bluesky)
