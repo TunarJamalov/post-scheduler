@@ -1,4 +1,5 @@
-import 'dotenv/config';
+import { config as loadEnv } from 'dotenv';
+loadEnv({ quiet: true });
 import { openDatabase } from './db.js';
 import { startScheduler } from './scheduler.js';
 import { createServer } from './server.js';
